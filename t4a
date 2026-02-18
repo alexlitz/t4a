@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""t4a - Task Queue for Agents
+Usage:
+  t4a add <prompt> [--priority N] [--depends-on JOB] [--gpu N] [--gpu-mem MB] [--requires-approval]
+  t4a list [--pending|--running|--done] [--tree]
+  t4a status [JOB] [--tree]
+  t4a peek [JOB]                    Quick summary as JSON
+  t4a ask JOB <question>            Ask cheap agent about job
+  t4a work [--agent NAME] [--command CMD] [--daemon]
+  t4a daemon start|stop|status
+  t4a claim|complete|fail|pause|kill|retry|priority|checkpoint|progress|approve JOB
+  t4a attach|logs|events JOB
+  t4a monitor [--auto-recover]
+  t4a recover|gc
+  t4a gpu [status|reserve N|release JOB]
+  t4a config get|set KEY [VALUE]
+
+Examples:
+  t4a add "Implement auth" --priority 80 --gpu 1
+  t4a work --command "claude --print" --daemon
+  t4a peek; t4a ask job-abc "What files changed?"
+"""
+import sys, os, json, yaml, uuid, time, subprocess, threading, shutil, signal, re, select, tty, termios
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, List, Any, Tuple
+
+T4A_DIR = Path(os.environ.get("T4A_DIR", Path.home() / ".t4a"))
+JOBS_DIR = T4A_DIR / "jobs"
+QUEUE_DIR = T4A_DIR / "queue"
+SESSIONS_DIR = T4A_DIR / "sessions"
+DELEGATION_DIR = T4A_DIR / "delegation"
+APPROVALS_DIR = T4A_DIR / "approvals"
+CONFIG_FILE = T4A_DIR / "config.yaml"
+RESOURCE_FILE = T4A_DIR / "resources.yaml"
+GPU_FILE = T4A_DIR / "gpus.yaml"
+
+class T4A:
+    def __init__(self):
+        self.ensure_structure()
+        self.config = self.load_config()
+    
+    def ensure_structure(self):
+        for d in [JOBS_DIR, QUEUE_DIR, SESSIONS_DIR, DELEGATION_DIR, APPROVALS_DIR]:
+            d.mkdir(parents=True, exist_ok=True)
+        for q in ["pending", "running", "done"]:
+            (QUEUE_DIR / q).mkdir(exist_ok=True)
+    
+    def load_config(self) -> dict:
+        if not CONFIG_FILE.exists():
+            gpu_count = GPUManager.detect_gpus()
+            cfg = {
+                "agents": {
+                    "default": {"command": "claude --print", "capabilities": ["file_read", "file_write", "shell_exec"]},
+                    "cheap": {"command": "claude --model claude-3-5-haiku --print", "capabilities": ["file_read"], "for": ["monitoring"]}
+                },
+                "resources": {"api_concurrent": 3, "tokens_per_minute": 100000},
+                "gpus": {"count": gpu_count, "exclusive": True, "memory_reservation": 0.9},
+                "session": {"heartbeat_interval": 30, "claim_timeout": 300},
+                "checkpoint": {"interval": 300},
+                "hooks": {"on_job_complete": [], "on_job_fail": []}
+            }
+            CONFIG_FILE.write_text(yaml.dump(cfg))
+            return cfg
+        return yaml.safe_load(CONFIG_FILE.read_text()) or {}
+    
+    def save_config(self):
+        CONFIG_FILE.write_text(yaml.dump(self.config))
+    
+    @staticmethod
+    def gen_id(prefix="job"): return f"{prefix}-{uuid.uuid4().hex[:8]}"
+    @staticmethod
+    def now(): return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    @staticmethod
+    def parse_age(age_str: str) -> datetime:
+        units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+        num = int(age_str[:-1]); unit = age_str[-1]
+        return datetime.now(timezone.utc) - timedelta(seconds=num * units[unit])
+
+class GPUManager:
+    def __init__(self, t4a: T4A): self.t4a = t4a
+    
+    @staticmethod
+    def detect_gpus() -> int:
+        try:
+            r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5)
+            return len([l for l in r.stdout.strip().split("\n") if l.strip()]) if r.returncode == 0 else 0
+        except: return 0
+    
+    @staticmethod
+    def get_gpu_info() -> List[dict]:
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
+            if r.returncode != 0: return []
+            return [{"index": int(p[0]), "name": p[1], "memory_total_mb": int(float(p[2])), "memory_used_mb": int(float(p[3])), "memory_free_mb": int(float(p[4])), "utilization_pct": int(float(p[5]))} for p in [[x.strip() for x in l.split(",")] for l in r.stdout.strip().split("\n") if l.strip()] if len(p) >= 6]
+        except: return []
+    
+    def load_state(self) -> dict:
+        return yaml.safe_load(GPU_FILE.read_text()) if GPU_FILE.exists() else {"reserved": {}, "jobs": {}}
+    
+    def save_state(self, state: dict): GPU_FILE.write_text(yaml.dump(state))
+    
+    def available_gpus(self) -> List[int]:
+        all_gpus = list(range(self.t4a.config.get("gpus", {}).get("count", GPUManager.detect_gpus())))
+        return [g for g in all_gpus if str(g) not in self.load_state().get("reserved", {})]
+    
+    def reserve(self, job_id: str, gpu_count: int = 1, memory_mb: int = None) -> Tuple[bool, List[int]]:
+        state = self.load_state()
+        available = self.available_gpus()
+        if memory_mb: available = [g for g in available if any(i["index"] == g and i["memory_free_mb"] >= memory_mb for i in self.get_gpu_info())]
+        if len(available) < gpu_count: return False, []
+        reserved = available[:gpu_count]
+        for g in reserved: state.setdefault("reserved", {})[str(g)] = job_id
+        state.setdefault("jobs", {})[job_id] = reserved
+        self.save_state(state)
+        return True, reserved
+    
+    def release(self, job_id: str):
+        state = self.load_state()
+        for g in state.get("jobs", {}).pop(job_id, []): state.get("reserved", {}).pop(str(g), None)
+        self.save_state(state)
+    
+    def status(self) -> dict:
+        gpu_info, state = self.get_gpu_info(), self.load_state()
+        result = {"gpus": [], "total": len(gpu_info), "available": 0}
+        for info in gpu_info:
+            rb = state.get("reserved", {}).get(str(info["index"]))
+            info["reserved"], info["reserved_by"] = rb is not None, rb
+            if not info["reserved"]: result["available"] += 1
+            result["gpus"].append(info)
+        return result
+
+class ResourceManager:
+    def __init__(self, t4a: T4A):
+        self.t4a = t4a
+        self.gpus = GPUManager(t4a)
+    
+    def load(self) -> dict:
+        return yaml.safe_load(RESOURCE_FILE.read_text()) if RESOURCE_FILE.exists() else {"usage": {}, "waiting": {}}
+    
+    def save(self, data: dict): RESOURCE_FILE.write_text(yaml.dump(data))
+    
+    def acquire(self, job_id: str, resources: dict) -> Tuple[bool, str]:
+        limits, state = self.t4a.config.get("resources", {}), self.load()
+        if resources.get("gpu", 0) > 0:
+            ok, _ = self.gpus.reserve(job_id, resources["gpu"], resources.get("gpu_memory"))
+            if not ok:
+                state.setdefault("waiting", {}).setdefault("gpu", []).append(job_id)
+                self.save(state)
+                return False, f"GPU not available"
+            resources = {k: v for k, v in resources.items() if not k.startswith("gpu")}
+        for r, amt in resources.items():
+            if sum(state["usage"].get(r, {}).values()) + amt > limits.get(r, 999):
+                state.setdefault("waiting", {}).setdefault(r, []).append(job_id)
+                self.save(state)
+                return False, f"{r} exhausted"
+            state.setdefault("usage", {}).setdefault(r, {})[job_id] = amt
+        for r in state.get("waiting", {}): state["waiting"][r] = [j for j in state["waiting"][r] if j != job_id]
+        self.save(state)
+        return True, ""
+    
+    def release(self, job_id: str):
+        state = self.load()
+        for r in state.get("usage", {}): state["usage"][r].pop(job_id, None)
+        for r in state.get("waiting", {}): state["waiting"][r] = [j for j in state["waiting"][r] if j != job_id]
+        self.save(state)
+        self.gpus.release(job_id)
+    
+    def status(self) -> dict:
+        limits, state = self.t4a.config.get("resources", {}), self.load()
+        return {**{r: {"limit": l, "used": sum(state.get("usage", {}).get(r, {}).values()), "available": l - sum(state.get("usage", {}).get(r, {}).values()), "waiting": len(state.get("waiting", {}).get(r, []))} for r, l in limits.items()}, "gpu": self.gpus.status()}
+
+class ApprovalManager:
+    def __init__(self, t4a: T4A):
+        self.t4a = t4a
+    
+    def needs_approval(self, job_id: str) -> bool:
+        job_dir = JOBS_DIR / job_id
+        return (job_dir / ".requires_approval").exists()
+    
+    def is_approved(self, job_id: str) -> bool:
+        return (APPROVALS_DIR / job_id).exists()
+    
+    def request_approval(self, job_id: str):
+        (JOBS_DIR / job_id / ".requires_approval").touch()
+    
+    def approve(self, job_id: str, approver: str = "user"):
+        (APPROVALS_DIR / job_id).write_text(json.dumps({"approved_by": approver, "approved_at": T4A.now()}))
+    
+    def reject(self, job_id: str):
+        if (APPROVALS_DIR / job_id).exists():
+            (APPROVALS_DIR / job_id).unlink()
+
+class JobManager:
+    def __init__(self, t4a: T4A):
+        self.t4a = t4a
+        self.resources = ResourceManager(t4a)
+        self.approvals = ApprovalManager(t4a)
+    
+    def create(self, prompt: str, priority: int = 50, depends_on: List[str] = None, 
+               gpu: int = 0, gpu_memory: int = None, requires_approval: bool = False, **kwargs) -> str:
+        job_id = T4A.gen_id()
+        job_dir = JOBS_DIR / job_id
+        job_dir.mkdir()
+        resources = kwargs.get("resources", {"api_concurrent": 1})
+        if gpu > 0:
+            resources["gpu"] = gpu
+            if gpu_memory: resources["gpu_memory"] = gpu_memory
+        job = {
+            "id": job_id, "prompt": prompt, "priority": priority,
+            "created_at": T4A.now(), "depends_on": depends_on or [],
+            "requirements": kwargs.get("requirements", {"agent_type": "any"}),
+            "resources": resources, "timeout": kwargs.get("timeout", "1h")
+        }
+        state = {
+            "status": "pending", "progress": 0.0, "claimed_by": None,
+            "claimed_at": None, "started_at": None, "last_heartbeat": None,
+            "attempts": 0, "checkpoints": [], "events": [], "allocated_gpus": []
+        }
+        (job_dir / "job.yaml").write_text(yaml.dump(job))
+        (job_dir / "state.yaml").write_text(yaml.dump(state))
+        (job_dir / "context.md").write_text(f"# Job: {job_id}\n\n## Prompt\n\n{prompt}\n")
+        (job_dir / "output.log").write_text("")
+        (job_dir / "events.jsonl").write_text("")
+        if requires_approval: self.approvals.request_approval(job_id)
+        self._link(job_id, "pending")
+        self._log_event(job_id, "created", {"prompt": prompt[:100], "resources": resources})
+        return job_id
+    
+    def find(self, job_id: str) -> Optional[Path]:
+        for q in ["running", "pending", "done"]:
+            link = QUEUE_DIR / q / job_id
+            if link.exists(): return link.resolve()
+        return None
+    
+    def get(self, job_id: str) -> tuple:
+        job_dir = self.find(job_id)
+        if not job_dir: return None, None
+        return (yaml.safe_load((job_dir / "job.yaml").read_text()),
+                yaml.safe_load((job_dir / "state.yaml").read_text()))
+    
+    def update_state(self, job_id: str, updates: dict):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state.update(updates)
+        (job_dir / "state.yaml").write_text(yaml.dump(state))
+    
+    def update_job(self, job_id: str, updates: dict):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        job = yaml.safe_load((job_dir / "job.yaml").read_text())
+        job.update(updates)
+        (job_dir / "job.yaml").write_text(yaml.dump(job))
+    
+    def set_progress(self, job_id: str, progress: float, message: str = ""):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state["progress"] = max(0, min(1, progress))
+        (job_dir / "state.yaml").write_text(yaml.dump(state))
+        self._log_event(job_id, "progress", {"pct": int(progress * 100), "message": message})
+    
+    def _link(self, job_id: str, queue: str):
+        for q in ["pending", "running", "done"]:
+            link = QUEUE_DIR / q / job_id
+            if link.exists(): link.unlink()
+        (QUEUE_DIR / queue / job_id).symlink_to(JOBS_DIR / job_id)
+    
+    def _log_event(self, job_id: str, event_type: str, data: dict = None):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        event = {"ts": T4A.now(), "type": event_type, **(data or {})}
+        with open(job_dir / "events.jsonl", "a") as f:
+            f.write(json.dumps(event) + "\n")
+    
+    def claim(self, job_id: str = None, session_id: str = None) -> Optional[str]:
+        if not session_id: session_id = os.environ.get("T4A_SESSION", T4A.gen_id("session"))
+        if job_id:
+            job, state = self.get(job_id)
+            if not job: return None
+            candidates = [self.find(job_id)]
+        else:
+            candidates = [j[0] for j in self._find_claimable()]
+        for job_dir in candidates:
+            if not job_dir: continue
+            job_id = job_dir.name
+            job, state = self.get(job_id)
+            if not self._deps_satisfied(job): continue
+            if self.approvals.needs_approval(job_id) and not self.approvals.is_approved(job_id):
+                self._log_event(job_id, "waiting_approval", {})
+                continue
+            ok, err = self.resources.acquire(job_id, job.get("resources", {}))
+            if not ok:
+                self._log_event(job_id, "resource_wait", {"error": err})
+                continue
+            allocated_gpus = []
+            if job.get("resources", {}).get("gpu", 0) > 0:
+                gpu_state = self.resources.gpus.load_state()
+                allocated_gpus = gpu_state.get("jobs", {}).get(job_id, [])
+            state.update({
+                "status": "running", "claimed_by": session_id,
+                "claimed_at": T4A.now(), "started_at": state.get("started_at") or T4A.now(),
+                "last_heartbeat": T4A.now(), "attempts": state.get("attempts", 0) + 1,
+                "allocated_gpus": allocated_gpus
+            })
+            (job_dir / "state.yaml").write_text(yaml.dump(state))
+            self._link(job_id, "running")
+            self._log_event(job_id, "claimed", {"session": session_id, "gpus": allocated_gpus})
+            return job_id
+        return None
+    
+    def _find_claimable(self) -> List[tuple]:
+        jobs = []
+        for link in (QUEUE_DIR / "pending").iterdir():
+            job_dir = link.resolve()
+            if not job_dir.exists(): continue
+            job, state = self.get(job_dir.name)
+            if state["status"] in ["pending", "paused"]:
+                score = job["priority"]
+                if job.get("resources", {}).get("gpu", 0) > 0: score -= 10
+                jobs.append((job_dir, score, job["created_at"]))
+        jobs.sort(key=lambda x: (-x[1], x[2]))
+        return jobs
+    
+    def _deps_satisfied(self, job: dict) -> bool:
+        for dep_id in job.get("depends_on", []):
+            _, dep_state = self.get(dep_id)
+            if not dep_state or dep_state.get("status") != "done": return False
+        return True
+    
+    def dep_tree(self, job_id: str, depth: int = 0) -> List[str]:
+        job, state = self.get(job_id)
+        if not job: return []
+        prefix = "  " * depth + ("└─ " if depth > 0 else "")
+        lines = [f"{prefix}{job_id} [{state['status']}] {job['prompt'][:40]}"]
+        for dep_id in job.get("depends_on", []):
+            lines.extend(self.dep_tree(dep_id, depth + 1))
+        return lines
+    
+    def complete(self, job_id: str, summary: str = ""):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state.update({"status": "done", "progress": 1.0, "completed_at": T4A.now(), "summary": summary})
+        (job_dir / "state.yaml").write_text(yaml.dump(state))
+        self.resources.release(job_id)
+        self._link(job_id, "done")
+        self._log_event(job_id, "completed", {"summary": summary[:100]})
+        self._run_hooks("on_job_complete", job_id)
+    
+    def fail(self, job_id: str, error: str = "", retryable: bool = False):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state.update({"status": "failed", "error": error, "failed_at": T4A.now()})
+        (job_dir / "state.yaml").write_text(yaml.dump(state))
+        self.resources.release(job_id)
+        self._link(job_id, "done")
+        self._log_event(job_id, "failed", {"error": error[:100], "retryable": retryable})
+        self._run_hooks("on_job_fail", job_id)
+    
+    def pause(self, job_id: str, message: str = ""):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state.update({"status": "paused", "claimed_by": None, "allocated_gpus": []})
+        (job_dir / "state.yaml").write_text(yaml.dump(state))
+        self.resources.release(job_id)
+        self._link(job_id, "pending")
+        self._log_event(job_id, "paused", {"message": message})
+        if message: self.checkpoint(job_id, message)
+    
+    def checkpoint(self, job_id: str, message: str = ""):
+        job_dir = self.find(job_id)
+        if not job_dir: return
+        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        cp = {"time": T4A.now(), "message": message, "progress": state.get("progress", 0)}
+        state.setdefault("checkpoints", []).append(cp)
+        (job_dir / "state.yaml").write_text(yaml.dump(state))
+        self._log_event(job_id, "checkpoint", {"message": message})
+        context = self._build_context(job_id, state)
+        (job_dir / "context.md").write_text(context)
+    
+    def _build_context(self, job_id: str, state: dict) -> str:
+        job, _ = self.get(job_id)
+        lines = [f"# Job: {job_id}", "", "## Prompt", "", job["prompt"], ""]
+        if job.get("resources", {}).get("gpu"):
+            lines.extend(["## GPU Requirements", "", f"GPUs: {job['resources']['gpu']}", ""])
+        if state.get("checkpoints"):
+            last_cp = state["checkpoints"][-1]
+            lines.extend(["## Last Checkpoint", "", f"- Time: {last_cp['time']}", f"- Message: {last_cp['message']}", ""])
+        if state.get("attempts", 0) > 1:
+            lines.extend(["## Resume Info", "", f"This job has been resumed {state['attempts']} times.", ""])
+        return "\n".join(lines)
+    
+    def _run_hooks(self, hook_name: str, job_id: str):
+        hooks = self.t4a.config.get("hooks", {}).get(hook_name, [])
+        for cmd in hooks:
+            env = os.environ.copy()
+            env["T4A_JOB_ID"] = job_id
+            subprocess.Popen(cmd, shell=True, env=env)
+    
+    def list(self, status_filter: str = None) -> List[dict]:
+        results = []
+        for q in ["pending", "running", "done"]:
+            for link in (QUEUE_DIR / q).iterdir():
+                job_dir = link.resolve()
+                if not job_dir.exists(): continue
+                job, state = self.get(job_dir.name)
+                if status_filter and state["status"] != status_filter: continue
+                results.append({"id": job_dir.name, **job, **state})
+        results.sort(key=lambda x: (-x.get("priority", 0), x.get("created_at", "")))
+        return results
+
+class SessionManager:
+    def __init__(self, t4a: T4A):
+        self.t4a = t4a
+    
+    def register(self, agent_type: str = "default") -> str:
+        session_id = T4A.gen_id("session")
+        session_dir = SESSIONS_DIR / session_id
+        session_dir.mkdir()
+        session = {"id": session_id, "agent_type": agent_type, "created_at": T4A.now(), "claimed_jobs": []}
+        (session_dir / "session.yaml").write_text(yaml.dump(session))
+        (session_dir / "heartbeat").write_text(T4A.now())
+        return session_id
+    
+    def heartbeat(self, session_id: str):
+        session_dir = SESSIONS_DIR / session_id
+        if session_dir.exists(): (session_dir / "heartbeat").write_text(T4A.now())
+    
+    def list(self) -> List[dict]:
+        results = []
+        for sdir in SESSIONS_DIR.iterdir():
+            if not sdir.is_dir(): continue
+            session = yaml.safe_load((sdir / "session.yaml").read_text())
+            hb = (sdir / "heartbeat").read_text().strip() if (sdir / "heartbeat").exists() else None
+            session["last_heartbeat"] = hb
+            results.append(session)
+        return results
+    
+    def kill(self, session_id: str):
+        session_dir = SESSIONS_DIR / session_id
+        if session_dir.exists(): shutil.rmtree(session_dir)
+    
+    def is_alive(self, session_id: str) -> bool:
+        session_dir = SESSIONS_DIR / session_id
+        if not session_dir.exists(): return False
+        timeout = self.t4a.config.get("session", {}).get("claim_timeout", 300)
+        hb_str = (session_dir / "heartbeat").read_text().strip()
+        try:
+            hb = datetime.fromisoformat(hb_str.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - hb).total_seconds() < timeout
+        except: return False
+
+class DelegationManager:
+    def __init__(self, t4a: T4A):
+        self.t4a = t4a
+    
+    def create(self, job_id: str, duration: str, monitor_type: str = "stalled") -> str:
+        task_id = T4A.gen_id("delegate")
+        task_dir = DELEGATION_DIR / task_id
+        task_dir.mkdir()
+        task = {"id": task_id, "target_job": job_id, "created_at": T4A.now(), 
+                "duration": duration, "monitor_type": monitor_type, "status": "pending"}
+        (task_dir / "task.yaml").write_text(yaml.dump(task))
+        return task_id
+    
+    def claim(self) -> Optional[str]:
+        for tdir in DELEGATION_DIR.iterdir():
+            if not tdir.is_dir(): continue
+            task = yaml.safe_load((tdir / "task.yaml").read_text())
+            if task["status"] == "pending":
+                task["status"] = "running"
+                (tdir / "task.yaml").write_text(yaml.dump(task))
+                return tdir.name
+        return None
+    
+    def complete(self, task_id: str, result: dict):
+        task_dir = DELEGATION_DIR / task_id
+        if not task_dir.exists(): return
+        task = yaml.safe_load((task_dir / "task.yaml").read_text())
+        task["status"] = "done"
+        task["result"] = result
+        (task_dir / "task.yaml").write_text(yaml.dump(task))
+
+def cmd_add(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    opts = parse_opts(args, ["--priority", "--depends-on", "--gpu", "--gpu-mem"])
+    prompt = " ".join(opts["args"])
+    if not prompt:
+        print("Usage: t4a add <prompt> [--priority N] [--gpu N] [--requires-approval]", file=sys.stderr); sys.exit(1)
+    priority = int(opts.get("--priority", 50))
+    depends = [d.strip() for d in opts.get("--depends-on", "").split(",")] if opts.get("--depends-on") else []
+    depends = [d if d.startswith("job-") else f"job-{d}" for d in depends if d]
+    gpu = int(opts.get("--gpu", 0))
+    gpu_mem = int(opts["--gpu-mem"]) if opts.get("--gpu-mem") else None
+    requires_approval = "--requires-approval" in opts
+    job_id = jm.create(prompt, priority=priority, depends_on=depends, 
+                       gpu=gpu, gpu_memory=gpu_mem, requires_approval=requires_approval)
+    extra = []
+    if gpu: extra.append(f"gpu: {gpu}")
+    if depends: extra.append(f"deps: {len(depends)}")
+    if requires_approval: extra.append("needs approval")
+    print(f"{job_id}" + (f" ({', '.join(extra)})" if extra else ""))
+
+def cmd_list(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    show_tree = "--tree" in args
+    args = [a for a in args if a != "--tree"]
+    status = {"--pending": "pending", "--running": "running", "--done": "done"}.get(args[0] if args else "", None)
+    if show_tree:
+        for j in jm.list(status):
+            lines = jm.dep_tree(j["id"])
+            for line in lines: print(line)
+        return
+    for j in jm.list(status):
+        pct = f"{int(j.get('progress', 0)*100):3d}%" if j["status"] == "running" else "     "
+        gpu = f" [G:{j.get('resources',{}).get('gpu',0)}]" if j.get('resources',{}).get('gpu',0) else ""
+        appr = " [NEEDS APPROVAL]" if (JOBS_DIR / j['id'] / ".requires_approval").exists() and not (APPROVALS_DIR / j['id']).exists() else ""
+        prompt = j["prompt"][:35] + ("..." if len(j["prompt"]) > 35 else "")
+        print(f"{j['id']}\t{pct}\t[P:{j['priority']:2d}]{gpu}\t{j['status']:8s}{appr}\t{prompt}")
+
+def cmd_status(args):
+    t4a = T4A(); jm = JobManager(t4a); rm = ResourceManager(t4a)
+    show_tree = "--tree" in args
+    args = [a for a in args if a != "--tree"]
+    if args and not args[0].startswith("-"):
+        job, state = jm.get(args[0])
+        if not job:
+            print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+        print(f"Job: {args[0]}\nStatus: {state['status']}\nPriority: {job['priority']}")
+        print(f"Progress: {int(state.get('progress', 0)*100)}%\nAttempts: {state.get('attempts', 0)}")
+        print(f"Created: {job['created_at']}")
+        if jm.approvals.needs_approval(args[0]):
+            approved = jm.approvals.is_approved(args[0])
+            print(f"Approval: {'APPROVED' if approved else 'PENDING'}")
+        if job.get("resources", {}).get("gpu"):
+            print(f"GPUs requested: {job['resources']['gpu']}")
+            if state.get("allocated_gpus"): print(f"GPUs allocated: {state['allocated_gpus']}")
+        if state.get("started_at"): print(f"Started: {state['started_at']}")
+        if state.get("claimed_by"): print(f"Claimed by: {state['claimed_by']}")
+        print(f"\nPrompt:\n{job['prompt']}")
+        if state.get("checkpoints"): print(f"\nLast Checkpoint: {state['checkpoints'][-1]['message']}")
+        if show_tree:
+            print("\nDependency Tree:")
+            for line in jm.dep_tree(args[0]): print(f"  {line}")
+        return
+    pending = len(list((QUEUE_DIR / "pending").iterdir()))
+    running = len(list((QUEUE_DIR / "running").iterdir()))
+    done = len(list((QUEUE_DIR / "done").iterdir()))
+    print(f"Queue: {pending} pending, {running} running, {done} done\n")
+    res = rm.status()
+    if res:
+        print("Resources:")
+        for r, info in res.items():
+            if r == "gpu":
+                if info.get("total", 0) > 0: print(f"  GPU: {info['available']}/{info['total']} available")
+            else: print(f"  {r}: {info['used']}/{info['limit']} ({info['waiting']} waiting)")
+        print()
+    for q in ["running", "pending"]:
+        jobs = list((QUEUE_DIR / q).iterdir())
+        if jobs:
+            print(f"{q.upper()}:")
+            for link in sorted(jobs, key=lambda x: x.name):
+                job, state = jm.get(link.name)
+                if not job: continue
+                pct = f"{int(state.get('progress', 0)*100):3d}%" if q == "running" else ""
+                gpu = f"[G:{job.get('resources',{}).get('gpu',0)}]" if job.get('resources',{}).get('gpu',0) else ""
+                print(f"  {link.name} {pct}\t[P:{job['priority']:2d}]{gpu}\t{job['prompt'][:35]}")
+
+def cmd_approve(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    if not args:
+        print("Usage: t4a approve <job_id>", file=sys.stderr); sys.exit(1)
+    job, state = jm.get(args[0])
+    if not job:
+        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    if not jm.approvals.needs_approval(args[0]):
+        print(f"Job {args[0]} does not require approval"); return
+    jm.approvals.approve(args[0])
+    print(f"Approved: {args[0]}")
+
+def cmd_progress(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    opts = parse_opts(args, ["--message"])
+    if len(opts["args"]) < 2:
+        print("Usage: t4a progress <job_id> <0-100> [--message TEXT]", file=sys.stderr); sys.exit(1)
+    job_id, pct = opts["args"][0], float(opts["args"][1]) / 100
+    jm.set_progress(job_id, pct, opts.get("--message", ""))
+    print(f"Progress: {int(pct*100)}%")
+
+def cmd_attach(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    if not args:
+        print("Usage: t4a attach <job_id>", file=sys.stderr); sys.exit(1)
+    job, state = jm.get(args[0])
+    if not job:
+        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    if state["status"] != "running":
+        print(f"Job is not running (status: {state['status']})", file=sys.stderr); sys.exit(1)
+    job_dir = jm.find(args[0])
+    log_file = job_dir / "output.log"
+    print(f"Attaching to {args[0]} (Ctrl+C to detach)...\n")
+    try:
+        subprocess.run(["tail", "-f", str(log_file)])
+    except KeyboardInterrupt:
+        print("\nDetached")
+
+def cmd_monitor(args):
+    t4a = T4A(); jm = JobManager(t4a); sm = SessionManager(t4a)
+    auto_recover = "--auto-recover" in args
+    interval = 30
+    print(f"t4a monitor starting (auto-recover: {auto_recover})")
+    while True:
+        for link in (QUEUE_DIR / "running").iterdir():
+            job_dir = link.resolve()
+            if not job_dir.exists(): continue
+            job_id = job_dir.name
+            job, state = jm.get(job_id)
+            if not state: continue
+            hb = state.get("last_heartbeat")
+            if hb:
+                try:
+                    hb_dt = datetime.fromisoformat(hb.replace("Z", "+00:00"))
+                    elapsed = (datetime.now(timezone.utc) - hb_dt).total_seconds()
+                    if elapsed > 300:
+                        msg = f"[ALERT] {job_id}: No heartbeat for {int(elapsed)}s"
+                        print(msg)
+                        if auto_recover:
+                            jm.pause(job_id, "Auto-recovered: no heartbeat")
+                            print(f"[RECOVERED] {job_id}")
+                except: pass
+        if auto_recover:
+            recovered = 0
+            for link in (QUEUE_DIR / "running").iterdir():
+                job_dir = link.resolve()
+                if not job_dir.exists(): continue
+                job, state = jm.get(job_dir.name)
+                if not state: continue
+                session_id = state.get("claimed_by")
+                if session_id and not sm.is_alive(session_id):
+                    jm.pause(job_dir.name, "Auto-recovered: session died")
+                    recovered += 1
+            if recovered: print(f"[RECOVERED] {recovered} stalled jobs")
+        time.sleep(interval)
+
+DAEMON_PID_FILE = T4A_DIR / "daemon.pid"
+DAEMON_LOG_FILE = T4A_DIR / "daemon.log"
+
+def cmd_daemon(args):
+    if not args:
+        print("Usage: t4a daemon start|stop|status", file=sys.stderr); sys.exit(1)
+    if args[0] == "status":
+        if DAEMON_PID_FILE.exists():
+            pid = int(DAEMON_PID_FILE.read_text().strip())
+            try:
+                os.kill(pid, 0)
+                print(f"Daemon running (pid: {pid})")
+                return
+            except OSError: pass
+        print("Daemon not running")
+    elif args[0] == "start":
+        if DAEMON_PID_FILE.exists():
+            pid = int(DAEMON_PID_FILE.read_text().strip())
+            try:
+                os.kill(pid, 0)
+                print(f"Daemon already running (pid: {pid})"); return
+            except OSError: pass
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            sys.stdin.close()
+            sys.stdout = open(DAEMON_LOG_FILE, "a")
+            sys.stderr = sys.stdout
+            os.chdir("/")
+            cmd_work(["--daemon"])
+        else:
+            DAEMON_PID_FILE.write_text(str(pid))
+            print(f"Daemon started (pid: {pid})")
+    elif args[0] == "stop":
+        if not DAEMON_PID_FILE.exists():
+            print("Daemon not running"); return
+        pid = int(DAEMON_PID_FILE.read_text().strip())
+        try:
+            os.kill(pid, signal.SIGTERM)
+            DAEMON_PID_FILE.unlink()
+            print(f"Daemon stopped (pid: {pid})")
+        except OSError:
+            DAEMON_PID_FILE.unlink()
+            print("Daemon not running")
+    else:
+        print("Usage: t4a daemon start|stop|status", file=sys.stderr); sys.exit(1)
+
+def cmd_gpu(args):
+    t4a = T4A(); gm = GPUManager(t4a)
+    if not args or args[0] == "status":
+        status = gm.status()
+        if not status["gpus"]: print("No GPUs detected"); return
+        print(f"GPUs: {status['available']}/{status['total']} available\n")
+        for g in status["gpus"]:
+            status_str = f"reserved by {g['reserved_by']}" if g["reserved"] else "available"
+            print(f"GPU {g['index']}: {g['name']}")
+            print(f"  Memory: {g['memory_used_mb']}/{g['memory_total_mb']} MB ({g['memory_free_mb']} MB free)")
+            print(f"  Utilization: {g['utilization_pct']}%\n  Status: {status_str}\n")
+    elif args[0] == "reserve" and len(args) > 1:
+        job_id = args[2] if len(args) > 2 else f"manual-{T4A.gen_id()}"
+        ok, gpus = gm.reserve(job_id, int(args[1]))
+        if ok: print(f"Reserved GPUs {gpus} for {job_id}")
+        else: print(f"Failed to reserve {args[1]} GPU(s)", file=sys.stderr); sys.exit(1)
+    elif args[0] == "release" and len(args) > 1:
+        gm.release(args[1])
+        print(f"Released GPUs for {args[1]}")
+    else:
+        print("Usage: t4a gpu [status|reserve N [job_id]|release job_id]", file=sys.stderr); sys.exit(1)
+
+def cmd_config(args):
+    t4a = T4A()
+    if len(args) < 2:
+        print("Usage: t4a config get|set <key> [value]", file=sys.stderr); sys.exit(1)
+    if args[0] == "get":
+        keys = args[1].split(".")
+        val = t4a.config
+        for k in keys:
+            val = val.get(k) if isinstance(val, dict) else None
+            if val is None: break
+        print(yaml.dump(val) if isinstance(val, (dict, list)) else val)
+    elif args[0] == "set" and len(args) > 2:
+        keys = args[1].split(".")
+        val = args[2]
+        if val.lower() == "true": val = True
+        elif val.lower() == "false": val = False
+        elif val.isdigit(): val = int(val)
+        cfg = t4a.config
+        for k in keys[:-1]: cfg = cfg.setdefault(k, {})
+        cfg[keys[-1]] = val
+        t4a.save_config()
+        print(f"Set {args[1]} = {val}")
+    else:
+        print("Usage: t4a config get|set <key> [value]", file=sys.stderr); sys.exit(1)
+
+def cmd_peek(args):
+    """Quick summary for agents - returns JSON for easy parsing"""
+    t4a = T4A(); jm = JobManager(t4a); rm = ResourceManager(t4a)
+    if args and not args[0].startswith("-"):
+        job, state = jm.get(args[0])
+        if not job:
+            print(json.dumps({"error": f"Job not found: {args[0]}"})); sys.exit(1)
+        result = {
+            "id": args[0], "status": state["status"], "priority": job["priority"],
+            "progress": state.get("progress", 0), "attempts": state.get("attempts", 0),
+            "prompt": job["prompt"], "resources": job.get("resources", {}),
+            "depends_on": job.get("depends_on", []), "claimed_by": state.get("claimed_by"),
+            "needs_approval": jm.approvals.needs_approval(args[0]) and not jm.approvals.is_approved(args[0]),
+            "last_checkpoint": state["checkpoints"][-1] if state.get("checkpoints") else None
+        }
+    else:
+        pending = []; running = []; done = []
+        for j in jm.list():
+            job_info = {"id": j["id"], "priority": j["priority"], "prompt": j["prompt"][:60]}
+            if j["status"] == "pending": pending.append(job_info)
+            elif j["status"] == "running": 
+                job_info["progress"] = j.get("progress", 0)
+                running.append(job_info)
+            else: done.append(job_info)
+        res = rm.status()
+        result = {
+            "queue": {"pending": len(pending), "running": len(running), "done": len(done)},
+            "resources": {k: v for k, v in res.items() if k != "gpu"},
+            "gpu": {"available": res["gpu"]["available"], "total": res["gpu"]["total"]} if res.get("gpu") else None,
+            "jobs": {"pending": pending[:5], "running": running}
+        }
+    print(json.dumps(result, indent=2))
+
+def cmd_ask(args):
+    """Ask a cheaper agent a question about a job"""
+    t4a = T4A(); jm = JobManager(t4a)
+    opts = parse_opts(args, ["--agent"])
+    if len(opts["args"]) < 2:
+        print("Usage: t4a ask <job_id> <question>", file=sys.stderr); sys.exit(1)
+    job_id, question = opts["args"][0], " ".join(opts["args"][1:])
+    job, state = jm.get(job_id)
+    if not job:
+        print(f"Job not found: {job_id}", file=sys.stderr); sys.exit(1)
+    agent_name = opts.get("--agent", "cheap")
+    agents = t4a.config.get("agents", {})
+    agent_cfg = agents.get(agent_name, agents.get("cheap", {"command": "claude --model claude-3-5-haiku --print"}))
+    agent_cmd = agent_cfg["command"]
+    job_dir = jm.find(job_id)
+    context = f"""# Job: {job_id}
+
+## Prompt
+{job['prompt']}
+
+## Status: {state['status']}
+## Progress: {int(state.get('progress', 0)*100)}%
+## Attempts: {state.get('attempts', 0)}
+
+## Checkpoints
+{chr(10).join(f"- {cp['message']}" for cp in state.get('checkpoints', [])) or 'None'}
+
+## Recent Events (last 20)
+"""
+    events_file = job_dir / "events.jsonl"
+    if events_file.exists():
+        events = events_file.read_text().strip().split("\n")[-20:]
+        for e in events:
+            try:
+                ev = json.loads(e)
+                context += f"- [{ev['ts'][:19]}] {ev['type']}\n"
+            except: pass
+    prompt = f"{context}\n\n## Question\n{question}\n\nAnswer concisely."
+    try:
+        proc = subprocess.Popen(
+            agent_cmd.split(), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout, stderr = proc.communicate(input=prompt, timeout=60)
+        print(stdout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        print("Agent timed out", file=sys.stderr); sys.exit(1)
+    except FileNotFoundError:
+        print(f"Agent not found: {agent_cmd}", file=sys.stderr); sys.exit(1)
+
+def cmd_events(args):
+    """View event log for a job"""
+    t4a = T4A(); jm = JobManager(t4a)
+    if not args:
+        print("Usage: t4a events <job_id>", file=sys.stderr); sys.exit(1)
+    job_dir = jm.find(args[0])
+    if not job_dir:
+        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    events_file = job_dir / "events.jsonl"
+    if not events_file.exists():
+        return
+    for line in events_file.read_text().strip().split("\n"):
+        try:
+            ev = json.loads(line)
+            ts = ev.get("ts", "")[:19]
+            typ = ev.get("type", "")
+            details = " ".join(f"{k}={v}" for k, v in ev.items() if k not in ["ts", "type"])
+            print(f"[{ts}] {typ} {details}")
+        except: print(line)
+
+def cmd_claim(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    session = os.environ.get("T4A_SESSION")
+    job_id = jm.claim(args[0] if args and not args[0].startswith("-") else None, session)
+    if job_id: print(job_id)
+    else: print("No jobs available", file=sys.stderr); sys.exit(1)
+
+def cmd_complete(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    opts = parse_opts(args, ["--summary"])
+    if not opts["args"]:
+        print("Usage: t4a complete <job_id>", file=sys.stderr); sys.exit(1)
+    jm.complete(opts["args"][0], opts.get("--summary", ""))
+    print(f"Completed: {opts['args'][0]}")
+
+def cmd_fail(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    opts = parse_opts(args, ["--error", "--retry"])
+    if not opts["args"]:
+        print("Usage: t4a fail <job_id>", file=sys.stderr); sys.exit(1)
+    jm.fail(opts["args"][0], opts.get("--error", "Failed"), "--retry" in opts)
+    print(f"Failed: {opts['args'][0]}")
+
+def cmd_pause(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    if not args:
+        print("Usage: t4a pause <job_id>", file=sys.stderr); sys.exit(1)
+    jm.pause(args[0])
+    print(f"Paused: {args[0]}")
+
+def cmd_kill(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    if not args:
+        print("Usage: t4a kill <job_id>", file=sys.stderr); sys.exit(1)
+    job, state = jm.get(args[0])
+    if not job:
+        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    session_id = state.get("claimed_by")
+    if session_id:
+        session_dir = SESSIONS_DIR / session_id
+        if session_dir.exists():
+            session = yaml.safe_load((session_dir / "session.yaml").read_text())
+            for job_id in session.get("claimed_jobs", []):
+                if job_id == args[0]:
+                    jm.pause(args[0], "Killed by user")
+                    print(f"Killed: {args[0]}")
+                    return
+    jm.fail(args[0], "Killed by user")
+    print(f"Killed: {args[0]}")
+
+def cmd_retry(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    if not args:
+        print("Usage: t4a retry <job_id>", file=sys.stderr); sys.exit(1)
+    job, state = jm.get(args[0])
+    if not job:
+        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    state["status"] = "pending"; state["error"] = None
+    jm.update_state(args[0], state)
+    jm._link(args[0], "pending")
+    print(f"Retrying: {args[0]}")
+
+def cmd_priority(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    if len(args) < 2:
+        print("Usage: t4a priority <job_id> <0-100>", file=sys.stderr); sys.exit(1)
+    jm.update_job(args[0], {"priority": max(0, min(100, int(args[1])))})
+    print(f"Priority set to {args[1]}")
+
+def cmd_checkpoint(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    opts = parse_opts(args, ["--message"])
+    if not opts["args"]:
+        print("Usage: t4a checkpoint <job_id>", file=sys.stderr); sys.exit(1)
+    jm.checkpoint(opts["args"][0], opts.get("--message", ""))
+    print("Checkpoint created")
+
+def cmd_delegate(args):
+    t4a = T4A(); dm = DelegationManager(t4a)
+    opts = parse_opts(args, ["--for"])
+    if not opts["args"]:
+        print("Usage: t4a delegate <job_id> --for <duration>", file=sys.stderr); sys.exit(1)
+    task_id = dm.create(opts["args"][0], opts.get("--for", "10m"))
+    print(f"Delegated: {task_id}")
+
+def cmd_recover(args):
+    t4a = T4A(); jm = JobManager(t4a); sm = SessionManager(t4a)
+    recovered = 0
+    for link in (QUEUE_DIR / "running").iterdir():
+        job_dir = link.resolve()
+        if not job_dir.exists(): continue
+        job, state = jm.get(job_dir.name)
+        if not state: continue
+        session_id = state.get("claimed_by")
+        if session_id and not sm.is_alive(session_id):
+            jm.pause(job_dir.name, "Session died")
+            recovered += 1
+    print(f"Recovered {recovered} stalled jobs")
+
+def cmd_gc(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    opts = parse_opts(args, ["--older-than"])
+    days = int(opts.get("--older-than", "7"))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cleaned = 0
+    for link in (QUEUE_DIR / "done").iterdir():
+        job_dir = link.resolve()
+        if not job_dir.exists(): continue
+        job, state = jm.get(job_dir.name)
+        if not job: continue
+        try:
+            created = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+            if created < cutoff:
+                shutil.rmtree(job_dir)
+                link.unlink()
+                cleaned += 1
+        except: pass
+    print(f"Cleaned {cleaned} old jobs")
+
+def cmd_logs(args):
+    t4a = T4A(); jm = JobManager(t4a)
+    if not args:
+        print("Usage: t4a logs <job_id>", file=sys.stderr); sys.exit(1)
+    follow = "-f" in args
+    job_id = [a for a in args if a != "-f"][0]
+    job_dir = jm.find(job_id)
+    if not job_dir:
+        print(f"Job not found: {job_id}", file=sys.stderr); sys.exit(1)
+    log_file = job_dir / "output.log"
+    if follow: subprocess.run(["tail", "-f", str(log_file)])
+    else: print(log_file.read_text())
+
+def cmd_session(args):
+    t4a = T4A(); sm = SessionManager(t4a)
+    if not args:
+        for s in sm.list():
+            alive = "alive" if sm.is_alive(s["id"]) else "dead"
+            print(f"{s['id']}\t{alive}\t{s['agent_type']}\t{s.get('last_heartbeat', '-')}")
+        return
+    if args[0] == "register":
+        agent_type = args[1] if len(args) > 1 else "default"
+        session_id = sm.register(agent_type)
+        print(session_id)
+    elif args[0] == "kill" and len(args) > 1:
+        sm.kill(args[1])
+        print(f"Killed: {args[1]}")
+
+def cmd_work(args):
+    t4a = T4A(); jm = JobManager(t4a); sm = SessionManager(t4a)
+    opts = parse_opts(args, ["--agent", "--command"])
+    agent_name = opts.get("--agent", "default")
+    agents = t4a.config.get("agents", {})
+    agent_cfg = agents.get(agent_name, agents.get("default", {"command": "claude --print"}))
+    agent_cmd = opts.get("--command") or agent_cfg["command"]
+    checkpoint_interval = t4a.config.get("checkpoint", {}).get("interval", 300)
+    is_daemon = "--daemon" in opts
+    session_id = sm.register(agent_name)
+    os.environ["T4A_SESSION"] = session_id
+    if not is_daemon:
+        print(f"t4a worker starting (session: {session_id}, agent: {agent_cmd})")
+        print("Press Ctrl+C to stop\n")
+    stop_flag = threading.Event()
+    def heartbeat_loop():
+        while not stop_flag.is_set():
+            sm.heartbeat(session_id)
+            stop_flag.wait(30)
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    current_job = None
+    def handle_signal(sig, frame):
+        stop_flag.set()
+        if current_job: jm.pause(current_job, "Worker stopped")
+        if not is_daemon: print("\nWorker stopped")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    while not stop_flag.is_set():
+        job_id = jm.claim(session_id=session_id)
+        if not job_id: time.sleep(5); continue
+        current_job = job_id
+        job, state = jm.get(job_id)
+        print(f"[{T4A.now()[:19]}] Claimed: {job_id}")
+        if state.get("allocated_gpus"):
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, state["allocated_gpus"]))
+        job_dir = jm.find(job_id)
+        context = (job_dir / "context.md").read_text()
+        prompt = f"{context}\n\n## Instructions\nComplete the task. When finished, summarize what you did.\n\nTo report progress: echo 'PROGRESS:50% Halfway done' in output."
+        if checkpoint_interval > 0:
+            def auto_checkpoint():
+                while not stop_flag.is_set() and current_job == job_id:
+                    stop_flag.wait(checkpoint_interval)
+                    if current_job == job_id: jm.checkpoint(job_id, "Auto checkpoint")
+            threading.Thread(target=auto_checkpoint, daemon=True).start()
+        try:
+            proc = subprocess.Popen(
+                agent_cmd.split(), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            stdout, _ = proc.communicate(input=prompt, timeout=3600)
+            for line in stdout.split("\n"):
+                if line.startswith("PROGRESS:"):
+                    m = re.match(r"PROGRESS:(\d+)%?\s*(.*)", line)
+                    if m: jm.set_progress(job_id, int(m.group(1))/100, m.group(2).strip())
+            with open(job_dir / "output.log", "a") as f: f.write(stdout)
+            if proc.returncode == 0:
+                jm.complete(job_id, stdout[-500:] if len(stdout) > 500 else stdout)
+                print(f"[{T4A.now()[:19]}] Completed: {job_id}")
+            else:
+                jm.fail(job_id, f"Exit code {proc.returncode}")
+                print(f"[{T4A.now()[:19]}] Failed: {job_id}")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            jm.fail(job_id, "Timeout")
+            print(f"[{T4A.now()[:19]}] Timeout: {job_id}")
+        except Exception as e:
+            jm.fail(job_id, str(e))
+            print(f"[{T4A.now()[:19]}] Error: {job_id} - {e}")
+        finally:
+            current_job = None
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+def parse_opts(args: List[str], flags: List[str]) -> dict:
+    result = {"args": []}
+    i = 0
+    while i < len(args):
+        if args[i] in flags and i + 1 < len(args):
+            result[args[i]] = args[i + 1]
+            i += 2
+        elif args[i].startswith("--"):
+            result[args[i]] = True
+            i += 1
+        else:
+            result["args"].append(args[i])
+            i += 1
+    return result
+
+def main():
+    if len(sys.argv) < 2: print(__doc__); sys.exit(1)
+    cmd = sys.argv[1]; args = sys.argv[2:]
+    commands = {
+        "add": cmd_add, "list": cmd_list, "status": cmd_status,
+        "claim": cmd_claim, "complete": cmd_complete, "fail": cmd_fail,
+        "pause": cmd_pause, "kill": cmd_kill, "retry": cmd_retry, "priority": cmd_priority,
+        "checkpoint": cmd_checkpoint, "delegate": cmd_delegate,
+        "recover": cmd_recover, "gc": cmd_gc, "logs": cmd_logs,
+        "session": cmd_session, "work": cmd_work, "daemon": cmd_daemon,
+        "gpu": cmd_gpu, "config": cmd_config, "approve": cmd_approve, 
+        "progress": cmd_progress, "attach": cmd_attach, "monitor": cmd_monitor,
+        "peek": cmd_peek, "ask": cmd_ask, "events": cmd_events
+    }
+    if cmd in commands: commands[cmd](args)
+    else: print(f"Unknown command: {cmd}", file=sys.stderr); sys.exit(1)
+
+if __name__ == "__main__":
+    main()
