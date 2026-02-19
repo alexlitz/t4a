@@ -341,7 +341,7 @@ class JobManager:
     def complete(self, job_id: str, summary: str = ""):
         job_dir = self.find(job_id)
         if not job_dir: return
-        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
         state.update({"status": "done", "progress": 1.0, "completed_at": T4A.now(), "summary": summary})
         (job_dir / "state.yaml").write_text(yaml.dump(state))
         self.resources.release(job_id)
@@ -352,7 +352,7 @@ class JobManager:
     def fail(self, job_id: str, error: str = "", retryable: bool = False):
         job_dir = self.find(job_id)
         if not job_dir: return
-        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
         state.update({"status": "failed", "error": error, "failed_at": T4A.now()})
         (job_dir / "state.yaml").write_text(yaml.dump(state))
         self.resources.release(job_id)
@@ -363,7 +363,7 @@ class JobManager:
     def pause(self, job_id: str, message: str = ""):
         job_dir = self.find(job_id)
         if not job_dir: return
-        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
         state.update({"status": "paused", "claimed_by": None, "allocated_gpus": []})
         (job_dir / "state.yaml").write_text(yaml.dump(state))
         self.resources.release(job_id)
@@ -374,7 +374,7 @@ class JobManager:
     def checkpoint(self, job_id: str, message: str = ""):
         job_dir = self.find(job_id)
         if not job_dir: return
-        state = yaml.safe_load((job_dir / "state.yaml").read_text())
+        state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
         cp = {"time": T4A.now(), "message": message, "progress": state.get("progress", 0)}
         state.setdefault("checkpoints", []).append(cp)
         (job_dir / "state.yaml").write_text(yaml.dump(state))
@@ -384,6 +384,7 @@ class JobManager:
     
     def _build_context(self, job_id: str, state: dict) -> str:
         job, _ = self.get(job_id)
+        if not job: return f"# Job: {job_id}\n\nJob not found."
         lines = [f"# Job: {job_id}", "", "## Prompt", "", job["prompt"], ""]
         if job.get("resources", {}).get("gpu"):
             lines.extend(["## GPU Requirements", "", f"GPUs: {job['resources']['gpu']}", ""])
@@ -1031,11 +1032,14 @@ def cmd_work(args):
         context = (job_dir / "context.md").read_text()
         prompt = f"{context}\n\n## Instructions\nComplete the task. When finished, summarize what you did.\n\nTo report progress: echo 'PROGRESS:50% Halfway done' in output."
         if checkpoint_interval > 0:
-            def auto_checkpoint():
-                while not stop_flag.is_set() and current_job == job_id:
+            def auto_checkpoint(my_job_id):
+                while not stop_flag.is_set() and current_job == my_job_id:
                     stop_flag.wait(checkpoint_interval)
-                    if current_job == job_id: jm.checkpoint(job_id, "Auto checkpoint")
-            threading.Thread(target=auto_checkpoint, daemon=True).start()
+                    if current_job == my_job_id:
+                        job, state = jm.get(my_job_id)
+                        if job and state.get("status") == "running":
+                            jm.checkpoint(my_job_id, "Auto checkpoint")
+            threading.Thread(target=auto_checkpoint, args=(job_id,), daemon=True).start()
         try:
             proc = subprocess.Popen(
                 agent_cmd.split(), stdin=subprocess.PIPE,
