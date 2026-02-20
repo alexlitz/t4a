@@ -192,87 +192,49 @@ class ApprovalManager:
             (APPROVALS_DIR / job_id).unlink()
 
 class JobManager:
-    def __init__(self, t4a: T4A):
-        self.t4a = t4a
-        self.resources = ResourceManager(t4a)
-        self.approvals = ApprovalManager(t4a)
-    
+    def __init__(self, t4a: T4A): self.t4a, self.resources, self.approvals = t4a, ResourceManager(t4a), ApprovalManager(t4a)
     def create(self, prompt: str, priority: int = 50, depends_on: List[str] = None, 
                gpu: int = 0, gpu_memory: int = None, requires_approval: bool = False, **kwargs) -> str:
-        job_id = T4A.gen_id()
-        job_dir = JOBS_DIR / job_id
-        job_dir.mkdir()
+        job_id = T4A.gen_id(); job_dir = JOBS_DIR / job_id; job_dir.mkdir()
         resources = kwargs.get("resources", {"api_concurrent": 1})
-        if gpu > 0:
-            resources["gpu"] = gpu
-            if gpu_memory: resources["gpu_memory"] = gpu_memory
-        job = {
-            "id": job_id, "prompt": prompt, "priority": priority,
-            "created_at": T4A.now(), "depends_on": depends_on or [],
-            "requirements": kwargs.get("requirements", {"agent_type": "any"}),
-            "resources": resources, "timeout": kwargs.get("timeout", "1h")
-        }
-        state = {
-            "status": "pending", "progress": 0.0, "claimed_by": None,
-            "claimed_at": None, "started_at": None, "last_heartbeat": None,
-            "attempts": 0, "checkpoints": [], "events": [], "allocated_gpus": []
-        }
-        (job_dir / "job.yaml").write_text(yaml.dump(job))
-        (job_dir / "state.yaml").write_text(yaml.dump(state))
+        if gpu > 0: resources["gpu"] = gpu
+        if gpu_memory: resources["gpu_memory"] = gpu_memory
+        (job_dir / "job.yaml").write_text(yaml.dump({"id": job_id, "prompt": prompt, "priority": priority, "created_at": T4A.now(), "depends_on": depends_on or [], "requirements": kwargs.get("requirements", {"agent_type": "any"}), "resources": resources, "timeout": kwargs.get("timeout", "1h")}))
+        (job_dir / "state.yaml").write_text(yaml.dump({"status": "pending", "progress": 0.0, "claimed_by": None, "claimed_at": None, "started_at": None, "last_heartbeat": None, "attempts": 0, "checkpoints": [], "events": [], "allocated_gpus": []}))
         (job_dir / "context.md").write_text(f"# Job: {job_id}\n\n## Prompt\n\n{prompt}\n")
-        (job_dir / "output.log").write_text("")
-        (job_dir / "events.jsonl").write_text("")
+        (job_dir / "output.log").write_text(""); (job_dir / "events.jsonl").write_text("")
         if requires_approval: self.approvals.request_approval(job_id)
-        self._link(job_id, "pending")
-        self._log_event(job_id, "created", {"prompt": prompt[:100], "resources": resources})
+        self._link(job_id, "pending"); self._log_event(job_id, "created", {"prompt": prompt[:100], "resources": resources})
         return job_id
-    
     def find(self, job_id: str) -> Optional[Path]:
         for q in ["running", "pending", "done"]:
-            link = QUEUE_DIR / q / job_id
-            if link.exists(): return link.resolve()
+            if (link := QUEUE_DIR / q / job_id).exists(): return link.resolve()
         return None
-    
     def get(self, job_id: str) -> tuple:
-        job_dir = self.find(job_id)
-        if not job_dir: return None, None
-        return (yaml.safe_load((job_dir / "job.yaml").read_text()),
-                yaml.safe_load((job_dir / "state.yaml").read_text()))
+        if not (job_dir := self.find(job_id)): return None, None
+        return yaml.safe_load((job_dir / "job.yaml").read_text()), yaml.safe_load((job_dir / "state.yaml").read_text())
     
     def update_state(self, job_id: str, updates: dict):
-        job_dir = self.find(job_id)
-        if not job_dir: return
-        state = yaml.safe_load((job_dir / "state.yaml").read_text())
-        state.update(updates)
+        if not (job_dir := self.find(job_id)): return
+        state = yaml.safe_load((job_dir / "state.yaml").read_text()); state.update(updates)
         (job_dir / "state.yaml").write_text(yaml.dump(state))
-    
     def update_job(self, job_id: str, updates: dict):
-        job_dir = self.find(job_id)
-        if not job_dir: return
-        job = yaml.safe_load((job_dir / "job.yaml").read_text())
-        job.update(updates)
+        if not (job_dir := self.find(job_id)): return
+        job = yaml.safe_load((job_dir / "job.yaml").read_text()); job.update(updates)
         (job_dir / "job.yaml").write_text(yaml.dump(job))
-    
     def set_progress(self, job_id: str, progress: float, message: str = ""):
-        job_dir = self.find(job_id)
-        if not job_dir: return
+        if not (job_dir := self.find(job_id)): return
         state = yaml.safe_load((job_dir / "state.yaml").read_text())
         state["progress"] = max(0, min(1, progress))
         (job_dir / "state.yaml").write_text(yaml.dump(state))
         self._log_event(job_id, "progress", {"pct": int(progress * 100), "message": message})
-    
     def _link(self, job_id: str, queue: str):
         for q in ["pending", "running", "done"]:
-            link = QUEUE_DIR / q / job_id
-            if link.exists(): link.unlink()
+            if (link := QUEUE_DIR / q / job_id).exists(): link.unlink()
         (QUEUE_DIR / queue / job_id).symlink_to(JOBS_DIR / job_id)
-    
     def _log_event(self, job_id: str, event_type: str, data: dict = None):
-        job_dir = self.find(job_id)
-        if not job_dir: return
-        event = {"ts": T4A.now(), "type": event_type, **(data or {})}
-        with open(job_dir / "events.jsonl", "a") as f:
-            f.write(json.dumps(event) + "\n")
+        if not (job_dir := self.find(job_id)): return
+        with open(job_dir / "events.jsonl", "a") as f: f.write(json.dumps({"ts": T4A.now(), "type": event_type, **(data or {})}) + "\n")
     
     def claim(self, job_id: str = None, session_id: str = None) -> Optional[str]:
         if not session_id: session_id = os.environ.get("T4A_SESSION", T4A.gen_id("session"))
@@ -324,166 +286,101 @@ class JobManager:
         return jobs
     
     def _deps_satisfied(self, job: dict) -> bool:
-        for dep_id in job.get("depends_on", []):
-            _, dep_state = self.get(dep_id)
-            if not dep_state or dep_state.get("status") != "done": return False
-        return True
-    
+        return all((dep := self.get(dep_id))[1] and dep[1].get("status") == "done" for dep_id in job.get("depends_on", []))
     def dep_tree(self, job_id: str, depth: int = 0) -> List[str]:
         job, state = self.get(job_id)
         if not job: return []
         prefix = "  " * depth + ("└─ " if depth > 0 else "")
-        lines = [f"{prefix}{job_id} [{state['status']}] {job['prompt'][:40]}"]
-        for dep_id in job.get("depends_on", []):
-            lines.extend(self.dep_tree(dep_id, depth + 1))
-        return lines
+        return [f"{prefix}{job_id} [{state['status']}] {job['prompt'][:40]}"] + [l for d in job.get("depends_on", []) for l in self.dep_tree(d, depth + 1)]
     
     def complete(self, job_id: str, summary: str = ""):
-        job_dir = self.find(job_id)
-        if not job_dir: return
+        if not (job_dir := self.find(job_id)): return
         state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
         state.update({"status": "done", "progress": 1.0, "completed_at": T4A.now(), "summary": summary})
         (job_dir / "state.yaml").write_text(yaml.dump(state))
-        self.resources.release(job_id)
-        self._link(job_id, "done")
-        self._log_event(job_id, "completed", {"summary": summary[:100]})
-        self._run_hooks("on_job_complete", job_id)
-    
+        self.resources.release(job_id); self._link(job_id, "done")
+        self._log_event(job_id, "completed", {"summary": summary[:100]}); self._run_hooks("on_job_complete", job_id)
     def fail(self, job_id: str, error: str = "", retryable: bool = False):
-        job_dir = self.find(job_id)
-        if not job_dir: return
+        if not (job_dir := self.find(job_id)): return
         state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
         state.update({"status": "failed", "error": error, "failed_at": T4A.now()})
         (job_dir / "state.yaml").write_text(yaml.dump(state))
-        self.resources.release(job_id)
-        self._link(job_id, "done")
-        self._log_event(job_id, "failed", {"error": error[:100], "retryable": retryable})
-        self._run_hooks("on_job_fail", job_id)
-    
+        self.resources.release(job_id); self._link(job_id, "done")
+        self._log_event(job_id, "failed", {"error": error[:100], "retryable": retryable}); self._run_hooks("on_job_fail", job_id)
     def pause(self, job_id: str, message: str = ""):
-        job_dir = self.find(job_id)
-        if not job_dir: return
+        if not (job_dir := self.find(job_id)): return
         state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
         state.update({"status": "paused", "claimed_by": None, "allocated_gpus": []})
         (job_dir / "state.yaml").write_text(yaml.dump(state))
-        self.resources.release(job_id)
-        self._link(job_id, "pending")
+        self.resources.release(job_id); self._link(job_id, "pending")
         self._log_event(job_id, "paused", {"message": message})
         if message: self.checkpoint(job_id, message)
-    
     def checkpoint(self, job_id: str, message: str = ""):
-        job_dir = self.find(job_id)
-        if not job_dir: return
+        if not (job_dir := self.find(job_id)): return
         state = yaml.safe_load((job_dir / "state.yaml").read_text()) or {}
-        cp = {"time": T4A.now(), "message": message, "progress": state.get("progress", 0)}
-        state.setdefault("checkpoints", []).append(cp)
+        state.setdefault("checkpoints", []).append({"time": T4A.now(), "message": message, "progress": state.get("progress", 0)})
         (job_dir / "state.yaml").write_text(yaml.dump(state))
         self._log_event(job_id, "checkpoint", {"message": message})
-        context = self._build_context(job_id, state)
-        (job_dir / "context.md").write_text(context)
+        (job_dir / "context.md").write_text(self._build_context(job_id, state))
     
     def _build_context(self, job_id: str, state: dict) -> str:
         job, _ = self.get(job_id)
         if not job: return f"# Job: {job_id}\n\nJob not found."
         lines = [f"# Job: {job_id}", "", "## Prompt", "", job["prompt"], ""]
-        if job.get("resources", {}).get("gpu"):
-            lines.extend(["## GPU Requirements", "", f"GPUs: {job['resources']['gpu']}", ""])
-        if state.get("checkpoints"):
-            last_cp = state["checkpoints"][-1]
-            lines.extend(["## Last Checkpoint", "", f"- Time: {last_cp['time']}", f"- Message: {last_cp['message']}", ""])
-        if state.get("attempts", 0) > 1:
-            lines.extend(["## Resume Info", "", f"This job has been resumed {state['attempts']} times.", ""])
+        if job.get("resources", {}).get("gpu"): lines.extend(["## GPU Requirements", "", f"GPUs: {job['resources']['gpu']}", ""])
+        if state.get("checkpoints"): lines.extend(["## Last Checkpoint", "", f"- Time: {state['checkpoints'][-1]['time']}", f"- Message: {state['checkpoints'][-1]['message']}", ""])
+        if state.get("attempts", 0) > 1: lines.extend(["## Resume Info", "", f"This job has been resumed {state['attempts']} times.", ""])
         return "\n".join(lines)
-    
     def _run_hooks(self, hook_name: str, job_id: str):
-        hooks = self.t4a.config.get("hooks", {}).get(hook_name, [])
-        for cmd in hooks:
-            env = os.environ.copy()
-            env["T4A_JOB_ID"] = job_id
-            subprocess.Popen(cmd, shell=True, env=env)
-    
+        for cmd in self.t4a.config.get("hooks", {}).get(hook_name, []): subprocess.Popen(cmd, shell=True, env={**os.environ, "T4A_JOB_ID": job_id})
     def list(self, status_filter: str = None) -> List[dict]:
         results = []
         for q in ["pending", "running", "done"]:
             for link in (QUEUE_DIR / q).iterdir():
-                job_dir = link.resolve()
-                if not job_dir.exists(): continue
+                if not (job_dir := link.resolve()).exists(): continue
                 job, state = self.get(job_dir.name)
                 if status_filter and state["status"] != status_filter: continue
                 results.append({"id": job_dir.name, **job, **state})
-        results.sort(key=lambda x: (-x.get("priority", 0), x.get("created_at", "")))
-        return results
+        return sorted(results, key=lambda x: (-x.get("priority", 0), x.get("created_at", "")))
 
 class SessionManager:
-    def __init__(self, t4a: T4A):
-        self.t4a = t4a
-    
+    def __init__(self, t4a: T4A): self.t4a = t4a
     def register(self, agent_type: str = "default") -> str:
-        session_id = T4A.gen_id("session")
-        session_dir = SESSIONS_DIR / session_id
+        session_id, session_dir = T4A.gen_id("session"), SESSIONS_DIR / T4A.gen_id("session")
         session_dir.mkdir()
-        session = {"id": session_id, "agent_type": agent_type, "created_at": T4A.now(), "claimed_jobs": []}
-        (session_dir / "session.yaml").write_text(yaml.dump(session))
+        (session_dir / "session.yaml").write_text(yaml.dump({"id": session_id, "agent_type": agent_type, "created_at": T4A.now(), "claimed_jobs": []}))
         (session_dir / "heartbeat").write_text(T4A.now())
         return session_id
-    
     def heartbeat(self, session_id: str):
-        session_dir = SESSIONS_DIR / session_id
-        if session_dir.exists(): (session_dir / "heartbeat").write_text(T4A.now())
-    
+        if (SESSIONS_DIR / session_id).exists(): (SESSIONS_DIR / session_id / "heartbeat").write_text(T4A.now())
     def list(self) -> List[dict]:
-        results = []
-        for sdir in SESSIONS_DIR.iterdir():
-            if not sdir.is_dir(): continue
-            session = yaml.safe_load((sdir / "session.yaml").read_text())
-            hb = (sdir / "heartbeat").read_text().strip() if (sdir / "heartbeat").exists() else None
-            session["last_heartbeat"] = hb
-            results.append(session)
-        return results
-    
+        return [{**yaml.safe_load((sdir / "session.yaml").read_text()), "last_heartbeat": (sdir / "heartbeat").read_text().strip() if (sdir / "heartbeat").exists() else None} for sdir in SESSIONS_DIR.iterdir() if sdir.is_dir()]
     def kill(self, session_id: str):
-        session_dir = SESSIONS_DIR / session_id
-        if session_dir.exists(): shutil.rmtree(session_dir)
-    
+        if (SESSIONS_DIR / session_id).exists(): shutil.rmtree(SESSIONS_DIR / session_id)
     def is_alive(self, session_id: str) -> bool:
-        session_dir = SESSIONS_DIR / session_id
-        if not session_dir.exists(): return False
-        timeout = self.t4a.config.get("session", {}).get("claim_timeout", 300)
-        hb_str = (session_dir / "heartbeat").read_text().strip()
-        try:
-            hb = datetime.fromisoformat(hb_str.replace("Z", "+00:00"))
-            return (datetime.now(timezone.utc) - hb).total_seconds() < timeout
+        if not (session_dir := SESSIONS_DIR / session_id).exists(): return False
+        try: return (datetime.now(timezone.utc) - datetime.fromisoformat((session_dir / "heartbeat").read_text().strip().replace("Z", "+00:00"))).total_seconds() < self.t4a.config.get("session", {}).get("claim_timeout", 300)
         except: return False
 
 class DelegationManager:
-    def __init__(self, t4a: T4A):
-        self.t4a = t4a
-    
+    def __init__(self, t4a: T4A): self.t4a = t4a
     def create(self, job_id: str, duration: str, monitor_type: str = "stalled") -> str:
-        task_id = T4A.gen_id("delegate")
-        task_dir = DELEGATION_DIR / task_id
+        task_id, task_dir = T4A.gen_id("delegate"), DELEGATION_DIR / T4A.gen_id("delegate")
         task_dir.mkdir()
-        task = {"id": task_id, "target_job": job_id, "created_at": T4A.now(), 
-                "duration": duration, "monitor_type": monitor_type, "status": "pending"}
-        (task_dir / "task.yaml").write_text(yaml.dump(task))
+        (task_dir / "task.yaml").write_text(yaml.dump({"id": task_id, "target_job": job_id, "created_at": T4A.now(), "duration": duration, "monitor_type": monitor_type, "status": "pending"}))
         return task_id
-    
     def claim(self) -> Optional[str]:
         for tdir in DELEGATION_DIR.iterdir():
             if not tdir.is_dir(): continue
             task = yaml.safe_load((tdir / "task.yaml").read_text())
             if task["status"] == "pending":
-                task["status"] = "running"
-                (tdir / "task.yaml").write_text(yaml.dump(task))
+                task["status"] = "running"; (tdir / "task.yaml").write_text(yaml.dump(task))
                 return tdir.name
         return None
-    
     def complete(self, task_id: str, result: dict):
-        task_dir = DELEGATION_DIR / task_id
-        if not task_dir.exists(): return
+        if not (task_dir := DELEGATION_DIR / task_id).exists(): return
         task = yaml.safe_load((task_dir / "task.yaml").read_text())
-        task["status"] = "done"
-        task["result"] = result
+        task.update({"status": "done", "result": result})
         (task_dir / "task.yaml").write_text(yaml.dump(task))
 
 def cmd_add(args):
@@ -573,41 +470,27 @@ def cmd_status(args):
 
 def cmd_approve(args):
     t4a = T4A(); jm = JobManager(t4a)
-    if not args:
-        print("Usage: t4a approve <job_id>", file=sys.stderr); sys.exit(1)
-    job, state = jm.get(args[0])
-    if not job:
-        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
-    if not jm.approvals.needs_approval(args[0]):
-        print(f"Job {args[0]} does not require approval"); return
-    jm.approvals.approve(args[0])
-    print(f"Approved: {args[0]}")
+    if not args: print("Usage: t4a approve <job_id>", file=sys.stderr); sys.exit(1)
+    if not jm.get(args[0])[0]: print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    if not jm.approvals.needs_approval(args[0]): print(f"Job {args[0]} does not require approval"); return
+    jm.approvals.approve(args[0]); print(f"Approved: {args[0]}")
 
 def cmd_progress(args):
     t4a = T4A(); jm = JobManager(t4a)
     opts = parse_opts(args, ["--message"])
-    if len(opts["args"]) < 2:
-        print("Usage: t4a progress <job_id> <0-100> [--message TEXT]", file=sys.stderr); sys.exit(1)
+    if len(opts["args"]) < 2: print("Usage: t4a progress <job_id> <0-100> [--message TEXT]", file=sys.stderr); sys.exit(1)
     job_id, pct = opts["args"][0], float(opts["args"][1]) / 100
-    jm.set_progress(job_id, pct, opts.get("--message", ""))
-    print(f"Progress: {int(pct*100)}%")
+    jm.set_progress(job_id, pct, opts.get("--message", "")); print(f"Progress: {int(pct*100)}%")
 
 def cmd_attach(args):
     t4a = T4A(); jm = JobManager(t4a)
-    if not args:
-        print("Usage: t4a attach <job_id>", file=sys.stderr); sys.exit(1)
+    if not args: print("Usage: t4a attach <job_id>", file=sys.stderr); sys.exit(1)
     job, state = jm.get(args[0])
-    if not job:
-        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
-    if state["status"] != "running":
-        print(f"Job is not running (status: {state['status']})", file=sys.stderr); sys.exit(1)
-    job_dir = jm.find(args[0])
-    log_file = job_dir / "output.log"
+    if not job: print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    if state["status"] != "running": print(f"Job is not running (status: {state['status']})", file=sys.stderr); sys.exit(1)
     print(f"Attaching to {args[0]} (Ctrl+C to detach)...\n")
-    try:
-        subprocess.run(["tail", "-f", str(log_file)])
-    except KeyboardInterrupt:
-        print("\nDetached")
+    try: subprocess.run(["tail", "-f", str(jm.find(args[0]) / "output.log")])
+    except KeyboardInterrupt: print("\nDetached")
 
 def cmd_monitor(args):
     t4a = T4A(); jm = JobManager(t4a); sm = SessionManager(t4a)
@@ -826,171 +709,110 @@ def cmd_ask(args):
         print(f"Agent not found: {agent_cmd}", file=sys.stderr); sys.exit(1)
 
 def cmd_events(args):
-    """View event log for a job"""
     t4a = T4A(); jm = JobManager(t4a)
-    if not args:
-        print("Usage: t4a events <job_id>", file=sys.stderr); sys.exit(1)
-    job_dir = jm.find(args[0])
-    if not job_dir:
-        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    if not args: print("Usage: t4a events <job_id>", file=sys.stderr); sys.exit(1)
+    if not (job_dir := jm.find(args[0])): print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
     events_file = job_dir / "events.jsonl"
-    if not events_file.exists():
-        return
+    if not events_file.exists(): return
     for line in events_file.read_text().strip().split("\n"):
         try:
-            ev = json.loads(line)
-            ts = ev.get("ts", "")[:19]
-            typ = ev.get("type", "")
-            details = " ".join(f"{k}={v}" for k, v in ev.items() if k not in ["ts", "type"])
-            print(f"[{ts}] {typ} {details}")
+            ev = json.loads(line); ts, typ = ev.get("ts", "")[:19], ev.get("type", "")
+            print(f"[{ts}] {typ} {' '.join(f'{k}={v}' for k, v in ev.items() if k not in ['ts', 'type'])}")
         except: print(line)
 
 def cmd_claim(args):
     t4a = T4A(); jm = JobManager(t4a)
-    session = os.environ.get("T4A_SESSION")
-    job_id = jm.claim(args[0] if args and not args[0].startswith("-") else None, session)
+    job_id = jm.claim(args[0] if args and not args[0].startswith("-") else None, os.environ.get("T4A_SESSION"))
     if job_id: print(job_id)
     else: print("No jobs available", file=sys.stderr); sys.exit(1)
 
 def cmd_complete(args):
     t4a = T4A(); jm = JobManager(t4a)
     opts = parse_opts(args, ["--summary"])
-    if not opts["args"]:
-        print("Usage: t4a complete <job_id>", file=sys.stderr); sys.exit(1)
-    jm.complete(opts["args"][0], opts.get("--summary", ""))
-    print(f"Completed: {opts['args'][0]}")
+    if not opts["args"]: print("Usage: t4a complete <job_id>", file=sys.stderr); sys.exit(1)
+    jm.complete(opts["args"][0], opts.get("--summary", "")); print(f"Completed: {opts['args'][0]}")
 
 def cmd_fail(args):
     t4a = T4A(); jm = JobManager(t4a)
     opts = parse_opts(args, ["--error", "--retry"])
-    if not opts["args"]:
-        print("Usage: t4a fail <job_id>", file=sys.stderr); sys.exit(1)
-    jm.fail(opts["args"][0], opts.get("--error", "Failed"), "--retry" in opts)
-    print(f"Failed: {opts['args'][0]}")
+    if not opts["args"]: print("Usage: t4a fail <job_id>", file=sys.stderr); sys.exit(1)
+    jm.fail(opts["args"][0], opts.get("--error", "Failed"), "--retry" in opts); print(f"Failed: {opts['args'][0]}")
 
 def cmd_pause(args):
     t4a = T4A(); jm = JobManager(t4a)
-    if not args:
-        print("Usage: t4a pause <job_id>", file=sys.stderr); sys.exit(1)
-    jm.pause(args[0])
-    print(f"Paused: {args[0]}")
+    if not args: print("Usage: t4a pause <job_id>", file=sys.stderr); sys.exit(1)
+    jm.pause(args[0]); print(f"Paused: {args[0]}")
 
 def cmd_kill(args):
     t4a = T4A(); jm = JobManager(t4a)
-    if not args:
-        print("Usage: t4a kill <job_id>", file=sys.stderr); sys.exit(1)
+    if not args: print("Usage: t4a kill <job_id>", file=sys.stderr); sys.exit(1)
     job, state = jm.get(args[0])
-    if not job:
-        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    if not job: print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
     session_id = state.get("claimed_by")
-    if session_id:
-        session_dir = SESSIONS_DIR / session_id
-        if session_dir.exists():
-            session = yaml.safe_load((session_dir / "session.yaml").read_text())
-            for job_id in session.get("claimed_jobs", []):
-                if job_id == args[0]:
-                    jm.pause(args[0], "Killed by user")
-                    print(f"Killed: {args[0]}")
-                    return
-    jm.fail(args[0], "Killed by user")
-    print(f"Killed: {args[0]}")
+    if session_id and (SESSIONS_DIR / session_id).exists():
+        session = yaml.safe_load((SESSIONS_DIR / session_id / "session.yaml").read_text())
+        if args[0] in session.get("claimed_jobs", []): jm.pause(args[0], "Killed by user"); print(f"Killed: {args[0]}"); return
+    jm.fail(args[0], "Killed by user"); print(f"Killed: {args[0]}")
 
 def cmd_retry(args):
     t4a = T4A(); jm = JobManager(t4a)
-    if not args:
-        print("Usage: t4a retry <job_id>", file=sys.stderr); sys.exit(1)
-    job, state = jm.get(args[0])
-    if not job:
-        print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
-    state["status"] = "pending"; state["error"] = None
-    jm.update_state(args[0], state)
-    jm._link(args[0], "pending")
-    print(f"Retrying: {args[0]}")
+    if not args: print("Usage: t4a retry <job_id>", file=sys.stderr); sys.exit(1)
+    if not jm.get(args[0])[0]: print(f"Job not found: {args[0]}", file=sys.stderr); sys.exit(1)
+    state = jm.get(args[0])[1]; state["status"] = "pending"; state["error"] = None
+    jm.update_state(args[0], state); jm._link(args[0], "pending"); print(f"Retrying: {args[0]}")
 
 def cmd_priority(args):
     t4a = T4A(); jm = JobManager(t4a)
-    if len(args) < 2:
-        print("Usage: t4a priority <job_id> <0-100>", file=sys.stderr); sys.exit(1)
-    jm.update_job(args[0], {"priority": max(0, min(100, int(args[1])))})
-    print(f"Priority set to {args[1]}")
+    if len(args) < 2: print("Usage: t4a priority <job_id> <0-100>", file=sys.stderr); sys.exit(1)
+    jm.update_job(args[0], {"priority": max(0, min(100, int(args[1])))}); print(f"Priority set to {args[1]}")
 
 def cmd_checkpoint(args):
     t4a = T4A(); jm = JobManager(t4a)
     opts = parse_opts(args, ["--message"])
-    if not opts["args"]:
-        print("Usage: t4a checkpoint <job_id>", file=sys.stderr); sys.exit(1)
-    jm.checkpoint(opts["args"][0], opts.get("--message", ""))
-    print("Checkpoint created")
+    if not opts["args"]: print("Usage: t4a checkpoint <job_id>", file=sys.stderr); sys.exit(1)
+    jm.checkpoint(opts["args"][0], opts.get("--message", "")); print("Checkpoint created")
 
 def cmd_delegate(args):
     t4a = T4A(); dm = DelegationManager(t4a)
     opts = parse_opts(args, ["--for"])
-    if not opts["args"]:
-        print("Usage: t4a delegate <job_id> --for <duration>", file=sys.stderr); sys.exit(1)
-    task_id = dm.create(opts["args"][0], opts.get("--for", "10m"))
-    print(f"Delegated: {task_id}")
+    if not opts["args"]: print("Usage: t4a delegate <job_id> --for <duration>", file=sys.stderr); sys.exit(1)
+    print(f"Delegated: {dm.create(opts['args'][0], opts.get('--for', '10m'))}")
 
 def cmd_recover(args):
     t4a = T4A(); jm = JobManager(t4a); sm = SessionManager(t4a)
-    recovered = 0
-    for link in (QUEUE_DIR / "running").iterdir():
-        job_dir = link.resolve()
-        if not job_dir.exists(): continue
-        job, state = jm.get(job_dir.name)
-        if not state: continue
-        session_id = state.get("claimed_by")
-        if session_id and not sm.is_alive(session_id):
-            jm.pause(job_dir.name, "Session died")
-            recovered += 1
+    recovered = sum(1 for link in (QUEUE_DIR / "running").iterdir() if (job_dir := link.resolve()).exists() and (state := jm.get(job_dir.name)[1]) and state.get("claimed_by") and not sm.is_alive(state["claimed_by"]) and (jm.pause(job_dir.name, "Session died") or True))
     print(f"Recovered {recovered} stalled jobs")
 
 def cmd_gc(args):
     t4a = T4A(); jm = JobManager(t4a)
     opts = parse_opts(args, ["--older-than"])
-    days = int(opts.get("--older-than", "7"))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(opts.get("--older-than", "7")))
     cleaned = 0
     for link in (QUEUE_DIR / "done").iterdir():
-        job_dir = link.resolve()
-        if not job_dir.exists(): continue
-        job, state = jm.get(job_dir.name)
+        if not (job_dir := link.resolve()).exists(): continue
+        job = jm.get(job_dir.name)[0]
         if not job: continue
         try:
-            created = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
-            if created < cutoff:
-                shutil.rmtree(job_dir)
-                link.unlink()
-                cleaned += 1
+            if datetime.fromisoformat(job["created_at"].replace("Z", "+00:00")) < cutoff:
+                shutil.rmtree(job_dir); link.unlink(); cleaned += 1
         except: pass
     print(f"Cleaned {cleaned} old jobs")
 
 def cmd_logs(args):
     t4a = T4A(); jm = JobManager(t4a)
-    if not args:
-        print("Usage: t4a logs <job_id>", file=sys.stderr); sys.exit(1)
-    follow = "-f" in args
-    job_id = [a for a in args if a != "-f"][0]
-    job_dir = jm.find(job_id)
-    if not job_dir:
-        print(f"Job not found: {job_id}", file=sys.stderr); sys.exit(1)
-    log_file = job_dir / "output.log"
-    if follow: subprocess.run(["tail", "-f", str(log_file)])
-    else: print(log_file.read_text())
+    if not args: print("Usage: t4a logs <job_id>", file=sys.stderr); sys.exit(1)
+    follow, job_id = "-f" in args, [a for a in args if a != "-f"][0]
+    if not (job_dir := jm.find(job_id)): print(f"Job not found: {job_id}", file=sys.stderr); sys.exit(1)
+    if follow: subprocess.run(["tail", "-f", str(job_dir / "output.log")])
+    else: print((job_dir / "output.log").read_text())
 
 def cmd_session(args):
     t4a = T4A(); sm = SessionManager(t4a)
     if not args:
-        for s in sm.list():
-            alive = "alive" if sm.is_alive(s["id"]) else "dead"
-            print(f"{s['id']}\t{alive}\t{s['agent_type']}\t{s.get('last_heartbeat', '-')}")
+        for s in sm.list(): print(f"{s['id']}\t{'alive' if sm.is_alive(s['id']) else 'dead'}\t{s['agent_type']}\t{s.get('last_heartbeat', '-')}")
         return
-    if args[0] == "register":
-        agent_type = args[1] if len(args) > 1 else "default"
-        session_id = sm.register(agent_type)
-        print(session_id)
-    elif args[0] == "kill" and len(args) > 1:
-        sm.kill(args[1])
-        print(f"Killed: {args[1]}")
+    if args[0] == "register": print(sm.register(args[1] if len(args) > 1 else "default"))
+    elif args[0] == "kill" and len(args) > 1: sm.kill(args[1]); print(f"Killed: {args[1]}")
 
 def cmd_work(args):
     t4a = T4A(); jm = JobManager(t4a); sm = SessionManager(t4a)
