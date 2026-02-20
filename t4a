@@ -346,7 +346,7 @@ class JobManager:
 class SessionManager:
     def __init__(self, t4a: T4A): self.t4a = t4a
     def register(self, agent_type: str = "default") -> str:
-        session_id, session_dir = T4A.gen_id("session"), SESSIONS_DIR / T4A.gen_id("session")
+        session_id = T4A.gen_id("session"); session_dir = SESSIONS_DIR / session_id
         session_dir.mkdir()
         (session_dir / "session.yaml").write_text(yaml.dump({"id": session_id, "agent_type": agent_type, "created_at": T4A.now(), "claimed_jobs": []}))
         (session_dir / "heartbeat").write_text(T4A.now())
@@ -365,7 +365,7 @@ class SessionManager:
 class DelegationManager:
     def __init__(self, t4a: T4A): self.t4a = t4a
     def create(self, job_id: str, duration: str, monitor_type: str = "stalled") -> str:
-        task_id, task_dir = T4A.gen_id("delegate"), DELEGATION_DIR / T4A.gen_id("delegate")
+        task_id = T4A.gen_id("delegate"); task_dir = DELEGATION_DIR / task_id
         task_dir.mkdir()
         (task_dir / "task.yaml").write_text(yaml.dump({"id": task_id, "target_job": job_id, "created_at": T4A.now(), "duration": duration, "monitor_type": monitor_type, "status": "pending"}))
         return task_id
