@@ -129,13 +129,9 @@ WantedBy=default.target
 EOF
     
     systemctl --user daemon-reload 2>/dev/null || true
-    echo "Created systemd service files"
-    echo ""
-    echo "To enable auto-start on login:"
-    echo "  systemctl --user enable t4a.service"
-    echo "  systemctl --user enable t4a-monitor.service"
-    echo "  systemctl --user start t4a.service"
-    echo "  systemctl --user start t4a-monitor.service"
+    systemctl --user enable t4a.service t4a-monitor.service 2>/dev/null || true
+    systemctl --user start t4a.service t4a-monitor.service 2>/dev/null || true
+    echo "Enabled and started systemd services"
 fi
 
 # Ensure PATH includes install dir
