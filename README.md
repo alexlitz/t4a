@@ -1,9 +1,22 @@
 # t4a - Task Queue for AI Agents
 
-A lightweight, file-based task queue for coordinating AI coding agents (Claude, Opencode, Aider, etc.). 823 lines of Python, zero dependencies beyond stdlib + PyYAML.
+A lightweight, file-based task queue for coordinating AI coding agents (Claude, Opencode, Aider, etc.). 825 lines of Python, zero dependencies beyond stdlib + PyYAML.
 
 ## Install
 
+One-liner (installs t4a + configures opencode/claude):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/alexlitz/t4a/main/install.sh | bash
+```
+
+This will:
+- Install `t4a` to `~/.local/bin/`
+- Configure opencode (`~/.config/opencode/AGENTS.md`)
+- Configure claude (`~/.claude/CLAUDE.md`)
+- Create systemd service files (Linux)
+
+Or manual install:
 ```bash
 mkdir -p ~/.local/bin
 curl -sSL https://raw.githubusercontent.com/alexlitz/t4a/main/t4a -o ~/.local/bin/t4a
@@ -14,6 +27,12 @@ Ensure `~/.local/bin` is in your PATH:
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
+```
+
+Verify:
+```bash
+t4a --version
+t4a status
 ```
 
 ## Quick Start
@@ -227,6 +246,70 @@ t4a monitor --auto-recover
 
 ```bash
 python3 test_t4a.py       # Run 26 unit tests
+```
+
+## Auto-Restart & Failure Tracking
+
+### Systemd Services (Linux)
+
+The install script creates two systemd user services:
+
+```bash
+# Enable auto-start on login
+systemctl --user enable t4a.service
+systemctl --user enable t4a-monitor.service
+
+# Start now
+systemctl --user start t4a.service
+systemctl --user start t4a-monitor.service
+
+# Check status
+systemctl --user status t4a.service
+systemctl --user status t4a-monitor.service
+
+# View logs
+journalctl --user -u t4a.service -f
+```
+
+**t4a.service** - Worker that processes jobs, auto-restarts on failure
+**t4a-monitor.service** - Monitors for stalled jobs and auto-recovers them
+
+### Failure Tracking
+
+Each job tracks:
+- **attempts** - Number of times claimed (retries)
+- **error** - Last error message
+- **failed_at** - Timestamp of failure
+- **checkpoints** - Saved states for resume
+
+```bash
+# View job history
+t4a status job-abc123
+t4a events job-abc123
+
+# Retry a failed job
+t4a retry job-abc123
+
+# View all failed jobs
+t4a list --done | grep failed
+```
+
+### Resume After Crash
+
+Jobs survive agent crashes:
+1. **Heartbeat monitoring** - If worker dies, monitor pauses job
+2. **Checkpoint restore** - Context.md contains resume info
+3. **Auto-recovery** - `t4a monitor --auto-recover` pauses stalled jobs
+
+```bash
+# Manual recovery
+t4a recover                 # Find and pause stalled jobs
+
+# Auto-recovery (run as daemon)
+t4a monitor --auto-recover &
+
+# Or use systemd
+systemctl --user start t4a-monitor.service
 ```
 
 ## Examples

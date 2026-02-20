@@ -20,6 +20,7 @@ Examples:
   t4a work --command "claude --print" --daemon
   t4a peek; t4a ask job-abc "What files changed?"
 """
+T4A_VERSION = "1.0.0"
 import sys, os, json, yaml, uuid, time, subprocess, threading, shutil, signal, re, select, tty, termios
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -907,6 +908,7 @@ def parse_opts(args: List[str], flags: List[str]) -> dict:
 
 def main():
     if len(sys.argv) < 2: print(__doc__); sys.exit(1)
+    if sys.argv[1] in ["--version", "-v", "version"]: print(f"t4a {T4A_VERSION}"); sys.exit(0)
     cmd = sys.argv[1]; args = sys.argv[2:]
     commands = {
         "add": cmd_add, "list": cmd_list, "status": cmd_status,
