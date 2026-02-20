@@ -1,11 +1,34 @@
 #!/bin/bash
 # t4a installer - idempotent, upgrades existing installs
-# Usage: curl -sSL https://raw.githubusercontent.com/alexlitz/t4a/main/install.sh | bash
+# Usage: 
+#   curl -sSL https://raw.githubusercontent.com/alexlitz/t4a/main/install.sh | bash
+#   t4a self-update  # Update t4a to latest version
 
 set -e
 
 INSTALL_DIR="${T4A_INSTALL_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="${T4A_CONFIG_DIR:-$HOME/.config}"
+T4A_BIN="$INSTALL_DIR/t4a"
+REPO_URL="https://raw.githubusercontent.com/alexlitz/t4a/main/t4a"
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/alexlitz/t4a/main/install.sh"
+
+# Self-update: if t4a is running and first arg is 'self-update'
+if [ "$1" = "self-update" ]; then
+    echo "Updating t4a..."
+    mkdir -p "$INSTALL_DIR"
+    curl -sSL "$REPO_URL" -o "$T4A_BIN"
+    chmod +x "$T4A_BIN"
+    NEW_VERSION=$("$T4A_BIN" --version 2>/dev/null || echo "unknown")
+    echo "Updated to $NEW_VERSION"
+    exit 0
+fi
+
+# If t4a exists and has self-update, delegate to it for 'self-update'
+if [ -x "$T4A_BIN" ] && command -v "$T4A_BIN" >/dev/null 2>&1; then
+    if [ "$1" = "self-update" ] || [ "$1" = "update" ]; then
+        exec "$T4A_BIN" self-update
+    fi
+fi
 
 echo "Installing t4a..."
 
@@ -15,10 +38,9 @@ mkdir -p "$CONFIG_DIR/opencode"
 mkdir -p "$CONFIG_DIR/claude"
 
 # Check for existing install
-T4A_BIN="$INSTALL_DIR/t4a"
 if [ -x "$T4A_BIN" ]; then
     OLD_VERSION=$("$T4A_BIN" --version 2>/dev/null || echo "unknown")
-    echo "Upgrading existing t4a installation..."
+    echo "Upgrading existing t4a installation ($OLD_VERSION)..."
 else
     echo "Fresh installation..."
 fi
@@ -93,7 +115,7 @@ else
     echo "Claude already configured"
 fi
 
-# Setup systemd service for auto-restart (Linux only)
+# Setup systemd service files (Linux only) - but don't auto-start
 if command -v systemctl >/dev/null 2>&1; then
     SYSTEMD_DIR="$HOME/.config/systemd/user"
     mkdir -p "$SYSTEMD_DIR"
@@ -129,9 +151,11 @@ WantedBy=default.target
 EOF
     
     systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user enable t4a.service t4a-monitor.service 2>/dev/null || true
-    systemctl --user start t4a.service t4a-monitor.service 2>/dev/null || true
-    echo "Enabled and started systemd services"
+    echo "Created systemd service files (not enabled)"
+    echo ""
+    echo "To enable auto-start on login (optional):"
+    echo "  systemctl --user enable --now t4a-monitor.service  # Just monitor"
+    echo "  systemctl --user enable --now t4a.service          # Worker (dispatches agents)"
 fi
 
 # Ensure PATH includes install dir
